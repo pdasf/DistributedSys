@@ -11,14 +11,6 @@ import (
 	"time"
 )
 
-const (
-	PullConfigInterval            = time.Millisecond * 100
-	PullShardsInterval            = time.Millisecond * 200
-	WaitCmdTimeOut                = time.Millisecond * 500
-	CallPeerFetchShardDataTimeOut = time.Millisecond * 500
-	CallPeerCleanShardDataTimeOut = time.Millisecond * 500
-)
-
 type Op struct {
 	Index     int64
 	Op        string
@@ -56,9 +48,6 @@ type ShardKV struct {
 	outputShards map[int]map[int]MergeShardData
 	scc          *shardctrler.Clerk
 	persister    *raft.Persister
-
-	pullConfigTimer *time.Timer
-	pullShardsTimer *time.Timer
 }
 
 func (kv *ShardKV) saveSnapshot(logIndex int) {
@@ -180,7 +169,7 @@ func (kv *ShardKV) fetchShards() {
 		select {
 		case <-kv.stopCh:
 			return
-		case <-kv.pullShardsTimer.C:
+		case <-time.Tick(time.Millisecond * 200):
 			_, isLeader := kv.rf.GetState()
 			if isLeader {
 				kv.mu.Lock()
@@ -189,8 +178,6 @@ func (kv *ShardKV) fetchShards() {
 				}
 				kv.mu.Unlock()
 			}
-			kv.pullShardsTimer.Reset(PullShardsInterval)
-
 		}
 	}
 }
@@ -201,9 +188,6 @@ func (kv *ShardKV) fetchShard(shardId int, config shardctrler.Config) {
 		ShardNum:  shardId,
 	}
 
-	t := time.NewTimer(CallPeerFetchShardDataTimeOut)
-	defer t.Stop()
-
 	for {
 		for _, s := range config.Groups[config.Shards[shardId]] {
 			reply := FetchShardDataReply{}
@@ -213,12 +197,10 @@ func (kv *ShardKV) fetchShard(shardId int, config shardctrler.Config) {
 				done <- srv.Call("ShardKV.FetchShardData", args, reply)
 			}(&args, &reply)
 
-			t.Reset(CallPeerFetchShardDataTimeOut)
-
 			select {
 			case <-kv.stopCh:
 				return
-			case <-t.C:
+			case <-time.Tick(time.Millisecond * 500):
 			case isDone := <-done:
 				if isDone && reply.Success == true {
 					kv.mu.Lock()
@@ -250,9 +232,6 @@ func (kv *ShardKV) callPeerCleanShardData(config shardctrler.Config, shardId int
 		ShardNum:  shardId,
 	}
 
-	t := time.NewTimer(CallPeerCleanShardDataTimeOut)
-	defer t.Stop()
-
 	for {
 		for _, group := range config.Groups[config.Shards[shardId]] {
 			reply := CleanShardDataReply{}
@@ -263,12 +242,10 @@ func (kv *ShardKV) callPeerCleanShardData(config shardctrler.Config, shardId int
 				done <- srv.Call("ShardKV.CleanShardData", args, reply)
 			}(&args, &reply)
 
-			t.Reset(CallPeerCleanShardDataTimeOut)
-
 			select {
 			case <-kv.stopCh:
 				return
-			case <-t.C:
+			case <-time.Tick(time.Millisecond * 500):
 			case isDone := <-done:
 				if isDone && reply.Success == true {
 					return
@@ -323,11 +300,9 @@ func (kv *ShardKV) waitApplier(clientId int64, commandId int64, method, key, val
 	ch := make(chan OpResult, 1)
 	kv.notifyCh[op.Index] = ch
 	kv.mu.Unlock()
-	t := time.NewTimer(WaitCmdTimeOut)
-	defer t.Stop()
 
 	select {
-	case <-t.C:
+	case <-time.Tick(time.Millisecond * 500):
 		res.Err = ErrTimeOut
 	case res = <-ch:
 	case <-kv.stopCh:
@@ -564,10 +539,9 @@ func (kv *ShardKV) pullConfig() {
 		select {
 		case <-kv.stopCh:
 			return
-		case <-kv.pullConfigTimer.C:
+		case <-time.Tick(time.Millisecond * 100):
 			_, isLeader := kv.rf.GetState()
 			if !isLeader {
-				kv.pullConfigTimer.Reset(PullConfigInterval)
 				break
 			}
 			kv.mu.Lock()
@@ -584,7 +558,6 @@ func (kv *ShardKV) pullConfig() {
 					kv.mu.Unlock()
 				}
 			}
-			kv.pullConfigTimer.Reset(PullConfigInterval)
 		}
 	}
 }
@@ -656,8 +629,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.readPersist(kv.persister.ReadSnapshot())
 
 	kv.notifyCh = make(map[int64]chan OpResult)
-	kv.pullConfigTimer = time.NewTimer(PullConfigInterval)
-	kv.pullShardsTimer = time.NewTimer(PullShardsInterval)
 
 	go kv.applier()
 

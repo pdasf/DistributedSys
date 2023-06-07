@@ -1,5 +1,7 @@
 package shardctrler
 
+import "mit6824/labgob"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -17,10 +19,10 @@ package shardctrler
 // You will need to add fields to the RPC argument structs.
 //
 
-// The number of shards.
+// NShards express The number of shards.
 const NShards = 10
 
-// A configuration -- an assignment of shards to groups.
+// Config :A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
 	Num    int              // config number
@@ -29,45 +31,75 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "wrongLeader"
+	ErrTimeOut     = "timeout"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	ClientId  int64
+	CommandId int64
 }
 
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	ClientId  int64
+	CommandId int64
 }
 
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	ClientId  int64
+	CommandId int64
 }
 
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	ClientId  int64
+	CommandId int64
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
+}
+
+func (c *Config) Copy() Config {
+	cfg := Config{
+		Num:    c.Num,
+		Shards: c.Shards,
+		Groups: make(map[int][]string),
+	}
+	for gid, s := range c.Groups {
+		cfg.Groups[gid] = append([]string{}, s...)
+	}
+	return cfg
+}
+
+func init() {
+	labgob.Register(Config{})
+	labgob.Register(QueryArgs{})
+	labgob.Register(QueryReply{})
+	labgob.Register(JoinArgs{})
+	labgob.Register(JoinReply{})
+	labgob.Register(LeaveArgs{})
+	labgob.Register(LeaveReply{})
+	labgob.Register(MoveArgs{})
+	labgob.Register(MoveReply{})
 }

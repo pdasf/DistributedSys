@@ -1,27 +1,28 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"mit6824/labgob"
 	"mit6824/labrpc"
 	"mit6824/raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
+type Op struct {
+	Index     int64
+	Op        string
+	Key       string
+	Value     string
+	ClientId  int64
+	CommandId int64
 }
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+type OpResult struct {
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -33,17 +34,55 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	persister    *raft.Persister
+	stateMachine map[string]string
+	notifyCh     map[int64]chan OpResult // index:OpResult
+	lastApplies  map[int64]int64         //ClientId:CommandId
+}
+
+func (kv *KVServer) delNotKey(index int64) {
+	kv.mu.Lock()
+	delete(kv.notifyCh, index)
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) waitApplier(op Op) (res OpResult) {
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		res.Err = ErrWrongLeader
+		return
+	}
+
+	ch := make(chan OpResult, 1)
+	kv.mu.Lock()
+	kv.notifyCh[op.Index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case res = <-ch:
+		kv.delNotKey(op.Index)
+		return
+	case <-time.Tick(time.Millisecond * 500):
+		kv.delNotKey(op.Index)
+		res.Err = ErrTimeOut
+		return
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{nrand(), "Get", args.Key, "", args.ClientId, args.CommandId}
+	res := kv.waitApplier(op)
+	reply.Err = res.Err
+	reply.Value = res.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{nrand(), args.Op, args.Key, args.Value, args.ClientId, args.CommandId}
+	res := kv.waitApplier(op)
+	reply.Err = res.Err
 }
 
+// Kill this server.
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -55,7 +94,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -63,10 +101,98 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
+func (kv *KVServer) saveSnapshot(logIndex int) {
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.stateMachine) != nil || e.Encode(kv.lastApplies) != nil {
+		log.Fatal("encode error")
+	}
+	data := w.Bytes()
+	kv.rf.Snapshot(logIndex, data)
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvData map[string]string
+	var lastApplies map[int64]int64
+
+	if d.Decode(&kvData) != nil || d.Decode(&lastApplies) != nil {
+		log.Fatal("read persist err")
+	} else {
+		kv.stateMachine = kvData
+		kv.lastApplies = lastApplies
+	}
+}
+
+func (kv *KVServer) sendNotifyCh(index int64, err Err, value string) {
+	if ch, ok := kv.notifyCh[index]; ok {
+		ch <- OpResult{
+			Err:   err,
+			Value: value,
+		}
+	}
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		if msg.CommandValid {
+			cmd := msg.Command.(Op)
+			kv.mu.Lock()
+			if cmd.Op == "Get" {
+				if v, ok := kv.stateMachine[cmd.Key]; !ok {
+					kv.sendNotifyCh(cmd.Index, ErrNoKey, v)
+				} else {
+					kv.sendNotifyCh(cmd.Index, OK, v)
+				}
+			} else {
+				isReply := false
+				if v, ok := kv.lastApplies[cmd.ClientId]; ok {
+					if v == cmd.CommandId {
+						isReply = true
+					}
+				}
+
+				if !isReply {
+
+					switch cmd.Op {
+					case "Put":
+						kv.stateMachine[cmd.Key] = cmd.Value
+					case "Append":
+						if v, ok := kv.stateMachine[cmd.Key]; ok {
+							kv.stateMachine[cmd.Key] = v + cmd.Value
+						} else {
+							kv.stateMachine[cmd.Key] = cmd.Value
+						}
+					}
+
+				}
+				kv.lastApplies[cmd.ClientId] = cmd.CommandId
+				kv.sendNotifyCh(cmd.Index, OK, "")
+			}
+
+			kv.saveSnapshot(msg.CommandIndex)
+			kv.mu.Unlock()
+		} else {
+			kv.mu.Lock()
+			kv.readPersist(msg.Snapshot)
+			kv.mu.Unlock()
+		}
+	}
+}
+
+// StartKVServer make a server instance.
+// servers[] contains the ports of the set of servers that will
+// cooperate via Raft to form the fault-tolerant key/value service.
+// me is the Index of the current server in servers[].
 // the k/v server should store snapshots through the underlying Raft
 // implementation, which should call persister.SaveStateAndSnapshot() to
 // atomically save the Raft state along with the snapshot.
@@ -83,13 +209,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.lastApplies = make(map[int64]int64)
+	kv.stateMachine = make(map[string]string)
+	kv.readPersist(kv.persister.ReadSnapshot())
+	kv.notifyCh = make(map[int64]chan OpResult)
 
+	go kv.applier()
 	return kv
 }

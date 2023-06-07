@@ -20,16 +20,16 @@ const (
 )
 
 type Op struct {
-	ReqId     int64
-	CommandId int64
-	ClientId  int64
+	Index     int64
+	Op        string
 	Key       string
 	Value     string
-	Method    string
+	ClientId  int64
+	CommandId int64
 	ConfigNum int
 }
 
-type CommandResult struct {
+type OpResult struct {
 	Err   Err
 	Value string
 }
@@ -41,16 +41,16 @@ type ShardKV struct {
 	applyCh      chan raft.ApplyMsg
 	makeEnd      func(string) *labrpc.ClientEnd
 	gid          int
-	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	//dead    int32 // set by Kill()
 
-	stopCh          chan struct{}
-	commandNotifyCh map[int64]chan CommandResult
-	lastApplies     [shardctrler.NShards]map[int64]int64 //k-v：ClientId-CommandId
-	config          shardctrler.Config
-	oldConfig       shardctrler.Config
-	meShards        map[int]bool
-	data            [shardctrler.NShards]map[string]string
+	stopCh       chan struct{}
+	notifyCh     map[int64]chan OpResult
+	lastApplies  [shardctrler.NShards]map[int64]int64 //k-v：ClientId-CommandId
+	config       shardctrler.Config
+	oldConfig    shardctrler.Config
+	meShards     map[int]bool
+	stateMachine [shardctrler.NShards]map[string]string
 
 	inputShards  map[int]bool
 	outputShards map[int]map[int]MergeShardData
@@ -67,14 +67,14 @@ func (kv *ShardKV) saveSnapshot(logIndex int) {
 	}
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	if e.Encode(kv.data) != nil ||
+	if e.Encode(kv.stateMachine) != nil ||
 		e.Encode(kv.lastApplies) != nil ||
 		e.Encode(kv.inputShards) != nil ||
 		e.Encode(kv.outputShards) != nil ||
 		e.Encode(kv.config) != nil ||
 		e.Encode(kv.oldConfig) != nil ||
 		e.Encode(kv.meShards) != nil {
-		panic("gen snapshot data encode err")
+		log.Fatal("encode error")
 	}
 	data := w.Bytes()
 	kv.rf.Snapshot(logIndex, data)
@@ -103,7 +103,7 @@ func (kv *ShardKV) readPersist(data []byte) {
 		d.Decode(&meShards) != nil {
 		log.Fatal("kv read persist err")
 	} else {
-		kv.data = kvData
+		kv.stateMachine = kvData
 		kv.lastApplies = lastApplies
 		kv.inputShards = inputShards
 		kv.outputShards = outputShards
@@ -285,31 +285,31 @@ func (kv *ShardKV) callPeerCleanShardData(config shardctrler.Config, shardId int
 	}
 }
 
-func (kv *ShardKV) removeCh(reqId int64) {
+func (kv *ShardKV) delNotKey(index int64) {
 	kv.mu.Lock()
-	if _, ok := kv.commandNotifyCh[reqId]; ok {
-		delete(kv.commandNotifyCh, reqId)
+	if _, ok := kv.notifyCh[index]; ok {
+		delete(kv.notifyCh, index)
 	}
 	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	res := kv.waitCommand(args.ClientId, args.CommandId, "Get", args.Key, "", args.ConfigNum)
+	res := kv.waitApplier(args.ClientId, args.CommandId, "Get", args.Key, "", args.ConfigNum)
 	reply.Err = res.Err
 	reply.Value = res.Value
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	res := kv.waitCommand(args.ClientId, args.CommandId, args.Op, args.Key, args.Value, args.ConfigNum)
+	res := kv.waitApplier(args.ClientId, args.CommandId, args.Op, args.Key, args.Value, args.ConfigNum)
 	reply.Err = res.Err
 }
 
-func (kv *ShardKV) waitCommand(clientId int64, commandId int64, method, key, value string, configNum int) (res CommandResult) {
+func (kv *ShardKV) waitApplier(clientId int64, commandId int64, method, key, value string, configNum int) (res OpResult) {
 	op := Op{
-		ReqId:     nrand(),
+		Index:     nrand(),
 		ClientId:  clientId,
 		CommandId: commandId,
-		Method:    method,
+		Op:        method,
 		Key:       key,
 		ConfigNum: configNum,
 		Value:     value,
@@ -320,8 +320,8 @@ func (kv *ShardKV) waitCommand(clientId int64, commandId int64, method, key, val
 		return
 	}
 	kv.mu.Lock()
-	ch := make(chan CommandResult, 1)
-	kv.commandNotifyCh[op.ReqId] = ch
+	ch := make(chan OpResult, 1)
+	kv.notifyCh[op.Index] = ch
 	kv.mu.Unlock()
 	t := time.NewTimer(WaitCmdTimeOut)
 	defer t.Stop()
@@ -334,14 +334,14 @@ func (kv *ShardKV) waitCommand(clientId int64, commandId int64, method, key, val
 		res.Err = ErrServer
 	}
 
-	kv.removeCh(op.ReqId)
+	kv.delNotKey(op.Index)
 	return
 
 }
 
-func (kv *ShardKV) notifyWaitCommand(reqId int64, err Err, value string) {
-	if ch, ok := kv.commandNotifyCh[reqId]; ok {
-		ch <- CommandResult{
+func (kv *ShardKV) sendNotifyCh(index int64, err Err, value string) {
+	if ch, ok := kv.notifyCh[index]; ok {
+		ch <- OpResult{
 			Err:   err,
 			Value: value,
 		}
@@ -349,7 +349,7 @@ func (kv *ShardKV) notifyWaitCommand(reqId int64, err Err, value string) {
 }
 
 func (kv *ShardKV) getValueByKey(key string) (err Err, value string) {
-	if v, ok := kv.data[key2shard(key)][key]; ok {
+	if v, ok := kv.stateMachine[key2shard(key)][key]; ok {
 		err = OK
 		value = v
 	} else {
@@ -373,7 +373,7 @@ func (kv *ShardKV) ProcessKeyReady(configNum int, key string) Err {
 	return OK
 }
 
-func (kv *ShardKV) handleApplyCh() {
+func (kv *ShardKV) applier() {
 	for {
 		select {
 		case <-kv.stopCh:
@@ -412,13 +412,13 @@ func (kv *ShardKV) handleOpCommand(cmdIdx int, op Op) {
 	defer kv.mu.Unlock()
 	shardId := key2shard(op.Key)
 	if err := kv.ProcessKeyReady(op.ConfigNum, op.Key); err != OK {
-		kv.notifyWaitCommand(op.ReqId, err, "")
+		kv.sendNotifyCh(op.Index, err, "")
 		return
 	}
-	if op.Method == "Get" {
+	if op.Op == "Get" {
 		e, v := kv.getValueByKey(op.Key)
-		kv.notifyWaitCommand(op.ReqId, e, v)
-	} else if op.Method == "Put" || op.Method == "Append" {
+		kv.sendNotifyCh(op.Index, e, v)
+	} else if op.Op == "Put" || op.Op == "Append" {
 		isRepeated := false
 		if v, ok := kv.lastApplies[shardId][op.ClientId]; ok {
 			if v == op.CommandId {
@@ -427,27 +427,27 @@ func (kv *ShardKV) handleOpCommand(cmdIdx int, op Op) {
 		}
 
 		if !isRepeated {
-			switch op.Method {
+			switch op.Op {
 			case "Put":
-				kv.data[shardId][op.Key] = op.Value
+				kv.stateMachine[shardId][op.Key] = op.Value
 				kv.lastApplies[shardId][op.ClientId] = op.CommandId
 			case "Append":
 				e, v := kv.getValueByKey(op.Key)
 				if e == ErrNoKey {
-					kv.data[shardId][op.Key] = op.Value
+					kv.stateMachine[shardId][op.Key] = op.Value
 					kv.lastApplies[shardId][op.ClientId] = op.CommandId
 				} else {
-					kv.data[shardId][op.Key] = v + op.Value
+					kv.stateMachine[shardId][op.Key] = v + op.Value
 					kv.lastApplies[shardId][op.ClientId] = op.CommandId
 				}
 			default:
-				panic("unknown method " + op.Method)
+				panic("unknown method " + op.Op)
 			}
 
 		}
-		kv.notifyWaitCommand(op.ReqId, OK, "")
+		kv.sendNotifyCh(op.Index, OK, "")
 	} else {
-		panic("unknown method " + op.Method)
+		panic("unknown method " + op.Op)
 	}
 
 	kv.saveSnapshot(cmdIdx)
@@ -493,11 +493,11 @@ func (kv *ShardKV) handleConfigCommand(cmdIdx int, config shardctrler.Config) {
 		mergeShardData := MergeShardData{
 			ConfigNum:      oldConfig.Num,
 			ShardNum:       shardId,
-			Data:           kv.data[shardId],
+			Data:           kv.stateMachine[shardId],
 			CommandIndexes: kv.lastApplies[shardId],
 		}
 		d[shardId] = mergeShardData
-		kv.data[shardId] = make(map[string]string)
+		kv.stateMachine[shardId] = make(map[string]string)
 		kv.lastApplies[shardId] = make(map[int64]int64)
 	}
 	kv.outputShards[oldConfig.Num] = d
@@ -524,11 +524,11 @@ func (kv *ShardKV) handleMergeShardDataCommand(cmdIdx int, data MergeShardData) 
 		return
 	}
 
-	kv.data[data.ShardNum] = make(map[string]string)
+	kv.stateMachine[data.ShardNum] = make(map[string]string)
 	kv.lastApplies[data.ShardNum] = make(map[int64]int64)
 
 	for k, v := range data.Data {
-		kv.data[data.ShardNum][k] = v
+		kv.stateMachine[data.ShardNum][k] = v
 	}
 	for k, v := range data.CommandIndexes {
 		kv.lastApplies[data.ShardNum][k] = v
@@ -549,15 +549,13 @@ func (kv *ShardKV) handleCleanShardDataCommand(cmdIdx int, data CleanShardDataAr
 	kv.saveSnapshot(cmdIdx)
 }
 
-//
+// Kill this server instance
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
-	// Your code here, if desired.
 	close(kv.stopCh)
 }
 
@@ -567,7 +565,6 @@ func (kv *ShardKV) pullConfig() {
 		case <-kv.stopCh:
 			return
 		case <-kv.pullConfigTimer.C:
-			//只有leader才能获取
 			_, isLeader := kv.rf.GetState()
 			if !isLeader {
 				kv.pullConfigTimer.Reset(PullConfigInterval)
@@ -579,12 +576,9 @@ func (kv *ShardKV) pullConfig() {
 
 			config := kv.scc.Query(lastNum + 1)
 			if config.Num == lastNum+1 {
-				//找到新的config
 				kv.mu.Lock()
-				//这一个判断很关键，必须当前shard全部迁移完成才能获取下一个config
 				if len(kv.inputShards) == 0 && kv.config.Num+1 == config.Num {
 					kv.mu.Unlock()
-					//请求该命令
 					kv.rf.Start(config.Copy())
 				} else {
 					kv.mu.Unlock()
@@ -633,21 +627,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.maxraftstate = maxraftstate
 	kv.makeEnd = makeEnd
 	kv.gid = gid
-	kv.ctrlers = ctrlers
-
-	// Your initialization code here.
 	kv.persister = persister
-	kv.scc = shardctrler.MakeClerk(kv.ctrlers)
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.scc = shardctrler.MakeClerk(ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.stopCh = make(chan struct{})
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.data = [shardctrler.NShards]map[string]string{}
-	for i := range kv.data {
-		kv.data[i] = make(map[string]string)
+	kv.stateMachine = [shardctrler.NShards]map[string]string{}
+	for i := range kv.stateMachine {
+		kv.stateMachine[i] = make(map[string]string)
 	}
 	kv.lastApplies = [shardctrler.NShards]map[int64]int64{}
 	for i := range kv.lastApplies {
@@ -656,7 +645,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.inputShards = make(map[int]bool)
 	kv.outputShards = make(map[int]map[int]MergeShardData)
-	//kv.cleanOutputDataNotifyCh = make(map[string]chan struct{})
 	config := shardctrler.Config{
 		Num:    0,
 		Shards: [shardctrler.NShards]int{},
@@ -667,11 +655,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.readPersist(kv.persister.ReadSnapshot())
 
-	kv.commandNotifyCh = make(map[int64]chan CommandResult)
+	kv.notifyCh = make(map[int64]chan OpResult)
 	kv.pullConfigTimer = time.NewTimer(PullConfigInterval)
 	kv.pullShardsTimer = time.NewTimer(PullShardsInterval)
 
-	go kv.handleApplyCh()
+	go kv.applier()
 
 	go kv.pullConfig()
 

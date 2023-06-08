@@ -129,7 +129,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastLog := rf.lastLog
 	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId) && 
-	(args.LastLogTerm > lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)) {
+	        (args.LastLogTerm > lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)) {
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
 		// Restart election timer when grant a vote to another peer.
@@ -209,11 +209,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = rf.lastLog.Index
 		reply.XTerm = logCom.Term
 		for reply.XIndex > rf.commitIndex && reply.XIndex > rf.LastSnapIndex && 
-		rf.Logs[reply.XIndex-rf.LastSnapIndex-1].Term == logCom.Term {
+		        rf.Logs[reply.XIndex-rf.LastSnapIndex-1].Term == logCom.Term {
 			reply.XIndex--
 		}
 		if (reply.XIndex == rf.LastSnapIndex && rf.LastSnapTerm != logCom.Term) || 
-		(reply.XIndex > rf.LastSnapIndex && rf.Logs[reply.XIndex-rf.LastSnapIndex-1].Term != logCom.Term) {
+		        (reply.XIndex > rf.LastSnapIndex && rf.Logs[reply.XIndex-rf.LastSnapIndex-1].Term != logCom.Term) {
 			reply.XIndex++
 		}
 		return
